@@ -51,6 +51,7 @@ class TestProposeMasterAddrAndPort:
     def test_the_proposal_steps_past_a_port_that_is_already_taken(self, monkeypatch: pytest.MonkeyPatch):
         """A cell rendezvouses on the proposing worker's own node, on a port no other process already holds."""
         monkeypatch.setattr(train_actor, "get_current_node_ip", lambda: "10.0.0.3")
+        monkeypatch.setattr(train_actor, "service_port_range", lambda: (20000, 32767))
 
         with socket.socket() as occupied:
             occupied.bind(("", train_actor.get_free_port(start_port=20500)))
@@ -439,6 +440,16 @@ class TestWeightUpdateOutputMerge:
         ]
 
         assert WeightUpdateOutput.merge(outputs) == WeightUpdateOutput(weight_version=None, failed_cell_ids=())
+
+
+def test_fwd_tflops_warns_and_reports_no_mfu_for_an_unknown_layer_structure(caplog):
+    actor = object.__new__(TrainRayActor)
+    actor.hf_config = SimpleNamespace(
+        model_type="mystery", hidden_size=8, vocab_size=8, num_hidden_layers=1, layer_types=["chunked_attention"]
+    )
+
+    assert actor._fwd_tflops is None
+    assert "no FLOPs definition" in caplog.text
 
 
 class TestBackendProcessGroupSdk:

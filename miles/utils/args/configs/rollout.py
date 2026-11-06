@@ -10,6 +10,8 @@ from miles.utils.object_store_config import ObjectStoreBackend
 # rollout
 class RolloutRelatedConfig(BaseConfig):
     custom_agent_function_path: A[CustomFunctionConfig | None, Arg()] = None
+    # agent functions --rollout-data-yaml-config datasets name, resolved at startup; abort fans out to them
+    rollout_dataset_agent_functions: list[CustomFunctionConfig] = []
     use_sampling_support_replay: bool
     rollout_sampling_logprobs_mode: Literal["selected", "support"]
     rollout_top_logprobs_num: A[int, Arg()] = 0
@@ -116,6 +118,29 @@ class RolloutRelatedConfig(BaseConfig):
         int,
         Arg(help="Number of Mooncake memory replicas for each stored object."),
     ] = 1
+    use_output_store: A[
+        bool,
+        Arg(
+            help=(
+                "Have SGLang put the routed experts, indexer top-k and sampling mask of training responses in the "
+                "run's Mooncake and return a ref instead of the arrays; the trainer reads them back, and the "
+                "objects are deleted once nothing can read them. Requires --object-store-backend mooncake."
+            )
+        ),
+    ] = False
+    # Fits a 32k-token DeepSeek-V3.2 response with indexer top-k (about 15.3 GiB).
+    output_store_local_buffer_size: A[
+        str,
+        Arg(
+            help=(
+                "Local buffer of every SGLang engine writing the output store, in bytes or as a string such as "
+                "'16gb'. An engine puts all stored arrays of a response through it at once, so it must hold one "
+                "response's routed experts, indexer top-k and sampling mask together. With RDMA, each engine pins "
+                "the whole buffer in host memory when it starts. Train workers read straight into their own arrays "
+                "and register none."
+            )
+        ),
+    ] = "16gb"
 
     # partial rollout
     async_unused_samples_handler: A[
@@ -228,12 +253,15 @@ class RolloutRelatedConfig(BaseConfig):
         str,
         Arg(
             type_parser=None,
-            choices=["broadcast", "broadcast_packed", "p2p", "disk-delta"],
+            choices=["broadcast", "broadcast_packed", "p2p", "disk-delta", "ici"],
             help=(
                 "The method to transfer weights to remote rollout engines during update weight. "
                 "'disk-delta' diffs each sync against a CPU snapshot of the previous one and publishes "
                 "only the changed bytes to --update-weight-disk-dir; each engine's /pull_weights applies "
-                "them into a host-local checkpoint that the engine reloads from."
+                "them into a host-local checkpoint that the engine reloads from. "
+                "'ici' sends each bucket device to device over the ICI links of a TPU slice the trainer "
+                "shares with one engine (MILES_TPU_SHARED_SLICE on the trainer, SGLANG_TPU_SHARED_SLICE "
+                "on the engine)."
             ),
         ),
     ] = "broadcast"
@@ -309,9 +337,23 @@ class RolloutRelatedConfig(BaseConfig):
         float,
         Arg(help="Seconds the trainer controller waits for one trainer cell's update_weights before giving it up."),
     ] = 600.0
+    p2p_transport: A[
+        str,
+        Arg(
+            type_parser=None,
+            choices=["mooncake", "nixl"],
+            help=(
+                "What a P2P weight update writes over. The rollout engines must publish their weights for it: "
+                "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine for mooncake, "
+                "--sglang-remote-instance-weight-loader-start-seed-via-nixl for nixl."
+            ),
+        ),
+    ] = "mooncake"
 
 
 class RolloutRelatedRolloutOnlyConfig(BaseConfig):
+    # hooks named by --rollout-data-yaml-config datasets, resolved at startup and keyed by path; not a flag
+    rollout_dataset_functions: dict[str, CustomFunctionConfig] = {}
     namespaced_radix_cache: A[
         bool | None,
         Arg(
@@ -379,8 +421,14 @@ class RolloutRelatedRolloutOnlyConfig(BaseConfig):
     ] = None
     rollout_shuffle: A[
         bool,
-        Arg(help="Whether to shuffle the prompts during rollout."),
-    ] = False
+        Arg(
+            action=argparse.BooleanOptionalAction,
+            help=(
+                "Whether to shuffle the prompts once per epoch during rollout (seeded by --rollout-seed). "
+                "Pass --no-rollout-shuffle to read the prompts in file order."
+            ),
+        ),
+    ] = True
     rollout_seed: A[
         int,
         Arg(
@@ -463,6 +511,18 @@ class RolloutRelatedRolloutOnlyConfig(BaseConfig):
             )
         ),
     ] = None
+    async_submit_within_staleness: A[
+        bool,
+        Arg(
+            help=(
+                "Also apply --max-weight-staleness N when the fully async producer submits a group: the default "
+                "data buffer admits one only while the buffered and in-flight groups number fewer than "
+                "N * rollout_batch_size, plus one rollout_batch_size while a training step waits for its batch. "
+                "N = 0 makes generation synchronous. Requires one weight version per training step, and a data "
+                "buffer that implements admits()."
+            )
+        ),
+    ] = False
     async_max_concurrent_samples: A[
         int | None,
         Arg(

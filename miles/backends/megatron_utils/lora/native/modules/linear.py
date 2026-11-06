@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from miles.backends.megatron_utils.lora.native.distributed import apply_lora_dropout, branch_input, reduce_row_parallel
 from miles.backends.megatron_utils.lora.native.spec.base import AttachContext, ProjectionSpec, ShardLayout
+from miles_plugins.models.deepseek_v4.ops.grouped_matmul import grouped_matmul
 
 
 @dataclass(frozen=True)
@@ -266,6 +267,42 @@ class LoRAReplicatedPlainLinear(LoRALinear):
         assert self.layout == ShardLayout.REPLICATED, f"{type(self).__name__} requires a replicated projection"
 
 
+class LoRAGroupedColumnLinear(LoRALinear):
+    """Column-parallel adapter on a grouped product: one ``A`` for every group, ``B`` split by group.
+
+    The host multiplies group ``g`` of its input by row block ``g`` of its weight only, and so does the
+    adapter, which makes its merged delta ``B @ A`` a plain LoRA on that weight. Each rank's input holds
+    only that rank's groups, so unlike ``LoRALinear`` the input takes no TP copy.
+    """
+
+    host_returns_bias = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        assert self.layout == ShardLayout.COLUMN, f"{type(self).__name__} requires a column-parallel projection"
+        # the host weight lives on the attention block; a list keeps it out of this adapter's parameters
+        self._host_weight = [kwargs["reference"]]
+
+    def forward(self, x: torch.Tensor, base_module: nn.Module, *_host_args) -> torch.Tensor:
+        x = apply_lora_dropout(x, self.context, base_module.training)
+        down = F.linear(
+            x, getattr(self, f"{self.param_prefix}_A")
+        )  # config-access-exempt: the projection prefix selects its registered A parameter
+        return grouped_matmul(
+            down, getattr(self, f"{self.param_prefix}_B")
+        )  # config-access-exempt: the projection prefix selects its registered B parameter
+
+    def weight_deltas(self):
+        (weight,) = self._host_weight
+        a = getattr(
+            self, f"{self.param_prefix}_A"
+        )  # config-access-exempt: the projection prefix selects its registered A parameter
+        b = getattr(
+            self, f"{self.param_prefix}_B"
+        )  # config-access-exempt: the projection prefix selects its registered B parameter
+        yield weight, lambda: self.context.lora.scale * (b.float() @ a.float())
+
+
 class LoRASplitAdapter(NativeLoRAAdapter):
     """Independent per-projection adapters whose deltas pack into one fused output.
 
@@ -331,27 +368,31 @@ class LoRASplitAdapter(NativeLoRAAdapter):
     def _pack_rows(self, delta: torch.Tensor) -> torch.Tensor:
         return self._pack(delta.t()).t()
 
+    def _packed_weight_delta(self, reference: torch.Tensor) -> torch.Tensor:
+        """The scaled delta of the whole fused output, rows laid out like the fused host's local shard."""
+        slots = [self._slot_weight_delta(name, reference) for name in self._rows_by_param_prefix]
+        return self.context.lora.scale * self._pack_rows(torch.cat(slots, dim=0))
+
+    def _slot_weight_delta(self, name: str, reference: torch.Tensor) -> torch.Tensor:
+        """One slot's unscaled fp32 ``B @ A``, zeros when its projection is not selected."""
+        if name not in self._active:
+            return reference.new_zeros(self._rows_by_param_prefix[name], reference.shape[1], dtype=torch.float32)
+        return (
+            getattr(self, f"{name}_B").float()
+            @ getattr(
+                self, f"{name}_A"
+            ).float()  # config-access-exempt: the registered projection name selects its A and B parameters
+        )
+
     def weight_deltas(self):
         (host,) = self._hosts
+        yield host.weight, lambda: self._packed_weight_delta(host.weight)
 
-        def delta() -> torch.Tensor:
-            slots = [
-                (
-                    getattr(self, f"{name}_B").float()
-                    @ getattr(
-                        self, f"{name}_A"
-                    ).float()  # config-access-exempt: the registered projection name selects its A and B parameters
-                    if name in self._active
-                    else host.weight.new_zeros(rows, host.weight.shape[1], dtype=torch.float32)
-                )
-                for name, rows in self._rows_by_param_prefix.items()
-            ]
-            return self.context.lora.scale * self._pack_rows(torch.cat(slots, dim=0))
-
-        yield host.weight, delta
+    def _branch_input(self, x: torch.Tensor, base_module: nn.Module) -> torch.Tensor:
+        return branch_input(x, base_module, self.context)
 
     def forward(self, x: torch.Tensor, base_module: nn.Module, *_host_args) -> torch.Tensor:
-        x = branch_input(x, base_module, self.context)
+        x = self._branch_input(x, base_module)
         rank = self.context.lora.rank
         down = F.linear(
             x, torch.cat([getattr(self, f"{name}_A") for name in self._active], dim=0)

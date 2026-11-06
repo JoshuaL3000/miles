@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from argparse import Namespace
 
 from transformers import LlamaConfig
@@ -24,7 +26,7 @@ class TestLoraTargetOrdering:
             lora_type="canonical_lora",
         )
 
-        hf_targets, adapter_targets = _resolve_lora_targets(args, config)
+        hf_targets = _resolve_lora_targets(args, config)
 
         expected = [
             "model.layers.0.mlp.down_proj",
@@ -41,6 +43,11 @@ class TestLoraTargetOrdering:
             "model.layers.1.self_attn.v_proj",
         ]
         assert hf_targets == expected
-        assert adapter_targets == expected
         assert args.target_modules == "all-linear"
         assert args.exclude_modules == "q_proj"
+
+
+def test_lora_arguments_import_no_megatron_to_hf():
+    """megatron_to_hf loads every converter and SGLang's quantization kernels, which probe the GPU on ROCm (#4201)."""
+    code = "import sys, miles.utils.lora.arguments; sys.exit('miles.backends.megatron_utils.megatron_to_hf' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", code]).returncode == 0
