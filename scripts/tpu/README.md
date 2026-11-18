@@ -7,9 +7,10 @@ engine. The two jobs share the host's slice, so weights move from trainer to eng
 
 ## Environment
 
-The engine and the trainer share one Python environment. `docker/Dockerfile.tpu` (`python docker/build.py
---variant tpu`, `radixark/miles:dev-tpu`) builds it on sglang-torchtpu's release image with the torch that
-`docker/Dockerfile` uses (the torchtitan backend needs torch >= 2.14). To set it up by hand, on that image:
+The engine and the trainer share one Python environment. `docker/Dockerfile.tpu` builds it on sglang-torchtpu's
+release image with the torch that `docker/Dockerfile` uses (the torchtitan backend needs torch >= 2.14); CI publishes
+it as `radixark/miles:dev-tpu` (see [Image](../../docs/hardware-platforms/google-tpus.md#image)). To set it up by
+hand, on that image:
 
 ```bash
 # the CUDA image's torch (CPU wheel; the image's torch_tpu ships glue for torch 2.11-2.15)
@@ -39,15 +40,16 @@ The first step of a run compiles the trainer's programs, about 20-30 minutes. Th
 program, and `--compile-cache-dir <dir>` keeps them across runs, so a rerun with the same model and settings starts
 its first step in seconds. Use a fresh directory for each torch_tpu build: the cache key covers the graph, shapes,
 compiler options, libtpu and kernel bodies, but not torch_tpu's own lowering code. The launcher also passes
-`--compile-warmup` (`--no-compile-warmup` turns it off): the trainer compiles its passes on a synthetic batch per
-length bucket at the end of its init, while the engine starts, so a cold run's first step no longer waits for them.
-With the launcher's settings (Qwen3-4B, sequence length 8192, the smoke recipe) a cold run's step 0 ends 34:40 after
-launch instead of 40:48, and the step itself takes 16 s instead of 31 min; the warmup's four buckets take 32 min of
-the trainer's init.
+`--compile-warmup` (`--no-compile-warmup` turns it off): the trainer compiles its passes on a synthetic batch at the
+end of its init, while the engine starts, so a cold run's first step no longer waits for them. Every packed microbatch
+is padded to `--seq-length`, so each pass compiles one program: packed microbatches are nearly full, and smaller
+shapes would save little compute for a compile each. With the launcher's settings (Qwen3-4B, sequence length 8192,
+the smoke recipe) a cold run's step 0 ended 34:40 after launch instead of 40:48, and the step itself took 16 s
+instead of 31 min; that warmup compiled four power-of-two lengths (1024 to 8192) in 32 min of the trainer's init.
 
 ## Run
 
-One launcher per model, each with the same `sglang` and `train` commands:
+One launcher per model, each with the same `prepare`, `sglang` and `train` commands:
 
 | Launcher | Model | Trainer |
 |---|---|---|
@@ -59,11 +61,17 @@ The MoE trainers keep every expert on each rank (EP 1); sglang serves them with 
 smoke recipe end to end on one v7x 2x2x1 host (cold compile caches; steps 1-2): Qwen3-30B-A3B at 266-313 s a step
 with 14 s weight syncs, GLM-4.7-Flash 4-layer at 80-82 s with 0.6-0.9 s syncs. The GLM engine traces with dynamo:
 the direct tracer aborts the MLA backend at startup. Model and data
-default to `/root/models` and `/root/datasets` (`--model-dir`, `--data-dir`); `train` downloads the
-model, dapo-math-17k and aime-2024 there if missing. The GLM launcher serves the cut checkpoint, so run its
-`prepare` before `sglang`. The steps below use Qwen3-4B.
+default to `/root/models` and `/root/datasets` (`--model-dir`, `--data-dir`); `prepare` (and `train`, which runs
+it first) downloads the model, dapo-math-17k and aime-2024 there if missing, and the GLM launcher's cuts the
+checkpoint it serves. The steps below use Qwen3-4B.
 
-1. Start sglang on devices 4-7, in its own shell. It waits for the trainer to join the slice before it
+1. Fetch the model and datasets:
+
+   ```bash
+   python3 scripts/tpu/run_qwen3_4b_torchtitan.py prepare
+   ```
+
+2. Start sglang on devices 4-7, in its own shell. It waits for the trainer to join the slice before it
    compiles, so `/health` returns 200 only after `train` has started; start `train` a minute or two after
    sglang, without waiting for it:
 
@@ -71,7 +79,7 @@ model, dapo-math-17k and aime-2024 there if missing. The GLM launcher serves the
    python3 scripts/tpu/run_qwen3_4b_torchtitan.py sglang
    ```
 
-2. Train on devices 0-3:
+3. Train on devices 0-3:
 
    ```bash
    python3 scripts/tpu/run_qwen3_4b_torchtitan.py train --recipe full
@@ -82,6 +90,9 @@ model, dapo-math-17k and aime-2024 there if missing. The GLM launcher serves the
    Pass extra `train.py` flags through `--extra-args`.
 
 wandb is on when `WANDB_API_KEY` is set.
+
+CI runs each launcher's smoke recipe this way on a v7x host (`.github/workflows/pr-test-tpu.yml`, label
+`run-ci-tpu`; `.github/tpu-ci/README.md`).
 
 `--extra-args "--titan-fsdp-reduce-dtype bfloat16 --no-titan-fsdp-gather-once"` reduce-scatters FSDP's
 gradients in bfloat16, halving the reduce buffers and the bytes over ICI. The Qwen3-4B launcher passes

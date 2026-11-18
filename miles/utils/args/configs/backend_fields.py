@@ -17,6 +17,8 @@ class TrainerBackendTraitConfig(BaseConfig):
     # from AlgoConfig
     ckpt_step: int | None
     rollout_indexer_topk_num_streams: int | None = None
+    # Layers where Megatron's pipeline stages split; the output store requests send them (`pp_layer_splits`).
+    replay_layer_splits: list[int] = []
     save: A[str | None, Arg(reset=True)] = None
     save_interval: A[int | None, Arg(reset=True)] = None
     async_save: A[bool, Arg(reset=True)]
@@ -33,7 +35,7 @@ class TrainerBackendTraitConfig(BaseConfig):
     ] = False
 
     # from ClusterConfig
-    distributed_backend: A[str, Arg(reset=True)] = "nccl"
+    distributed_backend: A[str | None, Arg(reset=True)] = None
     distributed_timeout_minutes: A[int, Arg(reset=True)] = 10
 
     # from EvalConfig
