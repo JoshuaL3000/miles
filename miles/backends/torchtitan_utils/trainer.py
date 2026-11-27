@@ -15,7 +15,6 @@ from torchtitan.training_engine import TrainingEngine
 from miles import platforms
 from miles.backends.torchtitan_utils import routing_replay
 from miles.backends.training_utils.torch_native.step_runner import StepMetrics
-from miles.utils.data import fixed_shape_length_bucket, fixed_shape_length_buckets
 
 _FLEX_BLOCK = 128
 _CP_LENGTH_BUCKET = 1024
@@ -36,6 +35,22 @@ def _compile_blocks(model_parts: list[torch.nn.Module], *, backend: str) -> None
             block.forward = torch.compile(block.forward, backend=backend, fullgraph=True)
 
 
+class _TrainingEngine(TrainingEngine):
+    """Reads the checkpoint through an adapter for the checkpoint's layout, which keeps parts the trained model drops
+    (multimodal encoders on TPU); torchtitan builds the adapter from the trained model's config."""
+
+    # TODO: drop once torchtitan's adapters take the HF layout from the checkpoint instead of the model config
+
+    def __init__(self, *args, checkpoint_model: BaseModel.Config, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._checkpoint_model = checkpoint_model
+
+    def _initialize_model(self, *, hf_assets_path: str, **kwargs) -> None:
+        super()._initialize_model(hf_assets_path=hf_assets_path, **kwargs)
+        if self.state_dict_adapter is not None and self._checkpoint_model is not self.model_config:
+            self.state_dict_adapter = type(self.state_dict_adapter)(self._checkpoint_model, hf_assets_path)
+
+
 class TitanTrainer(Configurable):
     """torchtitan's TrainingEngine builds, parallelizes, checkpoints and steps the model; miles feeds it
     variable-length packed microbatches through its own forward/backward loop."""
@@ -43,10 +58,14 @@ class TitanTrainer(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(TrainingEngine.Config):
         model: BaseModel.Config
+        # the model the checkpoint is laid out for: `model` plus any parts the trained model drops
+        checkpoint_model: BaseModel.Config
         hf_assets_path: str
         output_dir: str
         # torch.compile backend for each transformer block; None runs them eager
         compile_backend: str | None = None
+        # --true-on-policy-mode: the forward runs the rollout engine's batch-invariant ops (true_on_policy.py)
+        true_on_policy: bool = False
 
         def __post_init__(self) -> None:
             TrainingEngine.Config.__post_init__(self)
@@ -62,8 +81,12 @@ class TitanTrainer(Configurable):
     def __init__(self, config: Config, *, parallelism: ParallelismContext | None = None):
         self.config = config
         torch.autograd.set_multithreading_enabled(False)
-        self.engine = TrainingEngine(
-            config, model_config=config.model, max_num_documents=None, output_dir=config.output_dir
+        self.engine = _TrainingEngine(
+            config,
+            model_config=config.model,
+            checkpoint_model=config.checkpoint_model,
+            max_num_documents=None,
+            output_dir=config.output_dir,
         )
         if parallelism is not None:
             self.engine.parallelism_context = parallelism
@@ -72,6 +95,15 @@ class TitanTrainer(Configurable):
         self.model_parts = self.engine.model_parts
         if not platforms.current_platform.premul_sum_reduce:
             _force_sum_reduction(self.model_parts)
+        if config.true_on_policy:
+            # TPU only (validated at startup): it imports sglang_tpu
+            from miles.backends.torchtitan_utils import true_on_policy
+
+            for model in self.model_parts:
+                true_on_policy.install(model)
+                # install replaces each block's forward, and with it the engine's remat wrapper
+                if config.activation_remat is not None:
+                    config.activation_remat.apply(model)
         if config.compile_backend is not None:
             _compile_blocks(self.model_parts, backend=config.compile_backend)
         self.optimizers = self.engine.optim.optimizers
@@ -83,22 +115,15 @@ class TitanTrainer(Configurable):
         return self.engine.num_completed_steps
 
     def padded_length(self, n_tokens: int) -> int:
-        if self.parallelism.pp_enabled:
+        if self.parallelism.pp_enabled or not platforms.current_platform.dynamic_shapes:
+            # PP stages exchange one shape, and a fixed-shape platform compiles a program per shape
             target = self.config.training.max_context_length
             if n_tokens > target:
                 raise ValueError(
-                    f"packed microbatch of {n_tokens} tokens exceeds --seq-length "
-                    f"{target}, which is the fixed shape PP stages exchange"
+                    f"packed microbatch of {n_tokens} tokens exceeds --seq-length {target}, the fixed shape every "
+                    "microbatch pads to"
                 )
             return target
-        if not platforms.current_platform.dynamic_shapes:
-            # one compiled program per shape, so microbatches pad to a few power-of-two buckets
-            target = self.config.training.max_context_length
-            if n_tokens > target:
-                raise ValueError(
-                    f"packed microbatch of {n_tokens} tokens exceeds --seq-length {target}, the largest length bucket"
-                )
-            return fixed_shape_length_bucket(n_tokens, target)
         if self.parallelism.cp_enabled:
             align = max(self.parallelism.cp * _FLEX_BLOCK, _CP_LENGTH_BUCKET)
             return n_tokens + (align - n_tokens % align) % align
@@ -137,6 +162,10 @@ class TitanTrainer(Configurable):
             if pad:
                 tokens = torch.nn.functional.pad(tokens, (0, pad), value=0)
                 positions = torch.cat([positions, torch.arange(pad, device=positions.device, dtype=positions.dtype)])
+            if self.config.true_on_policy:
+                from miles.backends.torchtitan_utils import true_on_policy
+
+                true_on_policy.check_microbatch(positions)
             input_dict = {
                 "input": tokens.to(self.device),
                 "labels": torch.full_like(tokens, index, dtype=torch.long, device=self.device),
@@ -251,14 +280,15 @@ class TitanTrainer(Configurable):
         self.loss_fn.set_context_parallel(self.parallelism.get_mesh("cp"))
 
     def configure_fixed_shape_compile(self, *, num_passes: int) -> None:
-        """Each pass compiles once per length bucket; fullgraph blocks fail past dynamo's recompile limit."""
+        """Each pass compiles once for the fixed shape; fullgraph blocks fail past dynamo's recompile limit."""
         if platforms.current_platform.dynamic_shapes:
             return
         # a second length would otherwise make dynamo mark the dimension dynamic, which the backend rejects
         torch._dynamo.config.automatic_dynamic_shapes = False
         # blocks of one class share a forward, and a class can guard on a per-block flag (DeepSeek-V3-style dense
-        # first layers before MoE ones), so each class may hold two graphs per pass and bucket
-        num_graphs = 2 * num_passes * len(fixed_shape_length_buckets(self.config.training.max_context_length))
+        # first layers before MoE ones), so each class may hold two graphs per pass; true on-policy blocks share one
+        # forward over three graphs: the first block, and the later ones with a gated-delta-net or an attention
+        num_graphs = (3 if self.config.true_on_policy else 2) * num_passes
         torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, num_graphs)
 
     def has_last_stage(self) -> bool:

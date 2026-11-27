@@ -13,6 +13,8 @@ class TpuPlatform(Platform):
     triton_kernels = False
     # torch_tpu runs FlexAttention as one dense L x L mask
     flex_attention = False
+    # the encoders' FlexAttention has no TPU kernel and recompiles every step; their recompute's eager replay aborts
+    trains_multimodal_encoders = False
     # tpu_dist has no rooted reduce
     rooted_reduce = False
     # tpu_dist has no PREMUL_SUM
@@ -23,6 +25,8 @@ class TpuPlatform(Platform):
     prefill_weight_versions = False
     # the tpu compile backend takes static shapes only
     dynamic_shapes = False
+    # sglang-torchtpu's true on-policy log-prob kernel returns fp32, as the trainer's same kernel does
+    true_on_policy_fp32_logprobs = True
     nvml_numa_affinity = False
     # sglang-torchtpu turns "auto" into an fp8 KV cache without scales, which skews rollout logprobs against the
     # bf16 trainer; fp8 stays available through --sglang-kv-cache-dtype fp8_e4m3

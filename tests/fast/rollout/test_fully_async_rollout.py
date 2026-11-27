@@ -3,7 +3,7 @@ from tests.fast.fixtures.args_fixtures import sglang_router_args
 from tests.fast.fixtures.megatron_config_fixtures import encode_megatron_config
 from tests.fast.fixtures.sglang_config_fixtures import make_sglang_config
 
-register_cpu_ci(est_time=60, suite="stage-b-cpu", labels=["fully-async"])
+register_cpu_ci(est_time=10, suite="stage-b-cpu", labels=["fully-async"])
 
 import argparse
 import asyncio
@@ -103,11 +103,13 @@ def make_args(**overrides) -> Namespace:
         debug_rollout_only=False,
         debug_skip_weight_update=False,
         rollout_batch_size=2,
+        rollout_seed=0,
         n_samples_per_prompt=N_SAMPLES_PER_PROMPT,
         max_weight_staleness=None,
         async_submit_within_staleness=False,
         async_max_concurrent_samples=None,
         async_data_buffer_capacity_factor=1000.0,
+        async_data_buffer_selection="fifo",
         async_unused_samples_handler="drop",
         custom_async_data_buffer_path=None,
         enable_sample_ownership_checker=False,

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 
 from miles.backends.fsdp_utils.arguments import FSDPArgs, build_dataclass_parser, load_args_from_parser
-from miles.backends.training_utils.loss.hub.response_layout import validate_response_layout_args
+from miles.backends.training_utils.loss.hub.response_layout import padded_rows_enabled, validate_response_layout_args
 from miles.kernels.tpu import FLASH_ATTENTION_BLOCK
 from miles.platforms import current_platform, tpu_shared_slice
 from miles.utils.lora.utils import is_lora_enabled, lora_rollout_enabled
@@ -83,6 +83,8 @@ def validate_torchtitan_args(args) -> None:
         )
     if args.ref_update_interval is not None:
         raise ValueError("--ref-update-interval is not supported by the torchtitan backend")
+    if args.true_on_policy_mode:
+        _validate_true_on_policy_args(args)
     if args.fp16:
         raise ValueError("the torchtitan backend trains in bf16 mixed precision; --fp16 is not supported")
     if args.lr_decay_style not in ("constant", "linear", "cosine"):
@@ -93,8 +95,6 @@ def validate_torchtitan_args(args) -> None:
         raise ValueError(
             "torchtitan's LR schedule takes --lr-warmup-iters only; fraction, WSD and decay-iters are unsupported"
         )
-    if args.save_debug_train_data is not None:
-        raise ValueError("--save-debug-train-data is not wired up for the torchtitan backend")
     if args.use_routing_replay and not args.use_rollout_routing_replay and not current_platform.dynamic_shapes:
         raise ValueError(
             "--use-routing-replay without --use-rollout-routing-replay records the ids inside a compiled block, which "
@@ -148,6 +148,11 @@ def _validate_lora_args(args) -> None:
 
 def _validate_platform_args(args) -> None:
     platform = current_platform
+    if args.multimodal_keys is not None and not platform.trains_multimodal_encoders:
+        raise ValueError(
+            f"--multimodal-keys: multimodal training is not supported on {platform.device_type} yet; the trainer "
+            "builds the language model alone there"
+        )
     if args.log_probs_backend == "fused" and not platform.triton_kernels:
         raise ValueError(
             f"--log-probs-backend fused is a Triton kernel; on {platform.device_type} use --log-probs-backend torch"
@@ -162,17 +167,17 @@ def _validate_platform_args(args) -> None:
         )
     if platform.dynamic_shapes:
         return
-    # without dynamic shapes, packed microbatches are padded to a power-of-two bucket capped at --seq-length
+    # without dynamic shapes, every packed microbatch is padded to --seq-length, the one compiled shape
     if args.seq_length % FLASH_ATTENTION_BLOCK != 0:
         raise ValueError(
             f"--seq-length {args.seq_length} must be a multiple of {FLASH_ATTENTION_BLOCK} on {platform.device_type}: "
-            f"the splash attention kernel works in {FLASH_ATTENTION_BLOCK}-token blocks and the largest length bucket "
-            "is --seq-length"
+            f"the splash attention kernel works in {FLASH_ATTENTION_BLOCK}-token blocks and every microbatch pads to "
+            "--seq-length"
         )
-    if args.context_parallel_size != 1:
+    if args.seq_length % args.context_parallel_size:
         raise ValueError(
-            f"--context-parallel-size {args.context_parallel_size} is not supported on {platform.device_type}: "
-            "its length buckets do not align microbatches to the CP shards"
+            f"--context-parallel-size {args.context_parallel_size} does not divide --seq-length {args.seq_length}: "
+            "every microbatch pads to --seq-length and shards evenly across the CP ranks"
         )
     if args.expert_model_parallel_size != 1:
         raise ValueError(
@@ -183,10 +188,41 @@ def _validate_platform_args(args) -> None:
     if args.use_dynamic_batch_size and args.max_tokens_per_gpu > args.seq_length:
         raise ValueError(
             f"--max-tokens-per-gpu {args.max_tokens_per_gpu} exceeds --seq-length {args.seq_length}, "
-            "the largest length bucket"
+            "the shape every microbatch pads to"
         )
     if not args.use_dynamic_batch_size and args.micro_batch_size > 1:
         raise ValueError(
             f"--micro-batch-size {args.micro_batch_size} can pack more than --seq-length {args.seq_length} "
-            "tokens, the largest length bucket; use --use-dynamic-batch-size with --max-tokens-per-gpu"
+            "tokens, the shape every microbatch pads to; use --use-dynamic-batch-size with --max-tokens-per-gpu"
         )
+
+
+def _validate_true_on_policy_args(args) -> None:
+    """The trainer reproduces sglang-torchtpu's true on-policy programs (true_on_policy.py): TPU, no split reductions."""
+    if current_platform.device_type != "tpu":
+        raise ValueError("--true-on-policy-mode on the torchtitan backend runs on TPU only")
+    splits = {
+        "--tensor-model-parallel-size": args.tensor_model_parallel_size,
+        "--context-parallel-size": args.context_parallel_size,
+        "--pipeline-model-parallel-size": args.pipeline_model_parallel_size,
+    }
+    if bad := [f"{name} {size}" for name, size in splits.items() if size != 1]:
+        raise ValueError(f"--true-on-policy-mode needs every parallel split at 1, got {', '.join(bad)}")
+    # the engine does not check its own configuration: a TP split rounds partial sums, and nothing would say so
+    if args.rollout_num_gpus_per_engine != 1:
+        raise ValueError(
+            f"--true-on-policy-mode serves from a TP 1 engine, got --rollout-num-gpus-per-engine "
+            f"{args.rollout_num_gpus_per_engine}"
+        )
+    if args.entropy_coef != 0:
+        raise ValueError("--true-on-policy-mode scores with the engine's log-prob kernel, which has no entropy term")
+    if not padded_rows_enabled(args):
+        raise ValueError(
+            f"--true-on-policy-mode scores with the engine's log-prob kernel, which only the padded-row losses call; "
+            f"--loss-type {args.loss_type} does not"
+        )
+    # the installed forward runs each projection's base weight, so the adapters would drop out of the graph
+    if is_lora_enabled(args):
+        raise ValueError("--true-on-policy-mode does not cover LoRA")
+    if args.rollout_top_p != 1.0 or args.rollout_top_k > 0:
+        raise ValueError("--true-on-policy-mode covers plain temperature sampling: --rollout-top-p 1, no top-k")

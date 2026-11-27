@@ -1,4 +1,4 @@
-"""The training process's platform: what differs between CUDA and TPU (torch_tpu), chosen once by MILES_ACCELERATOR.
+"""The training process's platform: what differs between CUDA, TPU (torch_tpu), and XPU, chosen once by MILES_ACCELERATOR.
 
 Everything `torch.accelerator` covers (synchronize, empty_cache, memory stats, the device index) is called directly.
 """
@@ -7,6 +7,7 @@ import functools
 import os
 
 import torch
+import torch.distributed as dist
 
 
 class Platform:
@@ -19,6 +20,8 @@ class Platform:
     triton_kernels = True
     # FlexAttention compiles to a block-sparse kernel here
     flex_attention = True
+    # a multimodal model's encoders train here; elsewhere the trainer builds its language model alone
+    trains_multimodal_encoders = True
     # the process group has a rooted reduce
     rooted_reduce = True
     # the process group has PREMUL_SUM, which FSDP picks for a gradient divide factor other than the group size
@@ -33,6 +36,8 @@ class Platform:
     nvml_numa_affinity = True
     # the rollout engines' KV cache dtype when --sglang-kv-cache-dtype is left at "auto"; None keeps the engine's choice
     rollout_kv_cache_dtype: str | None = None
+    # under --true-on-policy-mode the engine returns log-probs in the trainer's precision (bf16); True: in fp32
+    true_on_policy_fp32_logprobs = False
 
     def bind_device_before_process_group(self, local_rank: int) -> None:
         torch.cuda.set_device(f"cuda:{local_rank}")
@@ -42,6 +47,11 @@ class Platform:
 
     def current_device(self) -> torch.device:
         return torch.device(self.device_type, torch.accelerator.current_device_index())
+
+    @property
+    def dist_backend(self) -> str:
+        """The collective backend torch pairs with this device: nccl on CUDA/ROCm, xccl on XPU."""
+        return dist.get_default_backend_for_device(self.device_type)
 
     @functools.cache  # noqa: B019 -- one instance per process
     def device_name(self) -> str | None:
@@ -58,7 +68,11 @@ def _select_platform() -> Platform:
         from miles.platforms.tpu import TpuPlatform
 
         return TpuPlatform()
-    raise ValueError(f"MILES_ACCELERATOR={device_type!r}; expected cuda or tpu")
+    if device_type == "xpu":
+        from miles.platforms.xpu import XpuPlatform
+
+        return XpuPlatform()
+    raise ValueError(f"MILES_ACCELERATOR={device_type!r}; expected cuda, tpu or xpu")
 
 
 current_platform = _select_platform()

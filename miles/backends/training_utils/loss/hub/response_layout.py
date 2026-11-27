@@ -40,6 +40,7 @@ from miles.backends.training_utils.loss.hub.math_utils import (
     calculate_log_probs_and_entropy,
     compute_ess_ratio_contribution,
 )
+from miles.backends.training_utils.loss.hub.row_log_prob import RowLogProb
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.types import RolloutBatch
@@ -50,17 +51,16 @@ logger = logging.getLogger(__name__)
 ROW_CHUNKS = 8
 _PADDED_ROWS_LOSS_TYPES = ("policy_loss", "score_centering")
 _PADDED_ROWS_ADVANTAGE_ESTIMATORS = ("grpo", "reinforce_plus_plus", "reinforce_plus_plus_baseline")
-# what PaddedRows assumes about the run: only without CP or PP is every padded row a whole packed sample
+# what PaddedRows assumes about the run: without PP every padded row is a whole packed sample (the torchtitan
+# trainer all-gathers the logits of its CP ranks before the loss)
 _PADDED_ROWS_REQUIREMENTS: dict[str, Callable[[Namespace], bool]] = {
     "--qkv-format thd": lambda args: args.qkv_format == "thd",
-    "--context-parallel-size 1": lambda args: args.context_parallel_size == 1,
     "--pipeline-model-parallel-size 1": lambda args: args.pipeline_model_parallel_size == 1,
     f"--advantage-estimator in {_PADDED_ROWS_ADVANTAGE_ESTIMATORS}": lambda args: args.advantage_estimator
     in _PADDED_ROWS_ADVANTAGE_ESTIMATORS,
 }
 # features whose code reads per-sample tensors, or that PaddedRows does not score
 _UNSUPPORTED_FEATURES: dict[str, Callable[[Namespace], bool]] = {
-    "--true-on-policy-mode": lambda args: args.true_on_policy_mode,
     "--log-probs-backend fused": lambda args: args.log_probs_backend == "fused",
     "--allgather-cp": lambda args: args.allgather_cp,
     "--use-sampling-support-replay": lambda args: args.use_sampling_support_replay,
@@ -249,6 +249,7 @@ class PackedSlices:
             entropy_requires_grad=entropy_requires_grad,
             max_seq_lens=self.batch.get("max_seq_lens"),
             rollout_sampling_mask=self._sampling_masks(),
+            lm_head=self.batch.get("lm_head"),
         )
         entropy = torch.cat(result["entropy"], dim=0) if with_entropy else None
         return torch.cat(result["log_probs"], dim=0), entropy
@@ -416,6 +417,12 @@ class PaddedRows:
         return self._loss_masks
 
     def score(self, logits, *, with_entropy, entropy_requires_grad):
+        # Decided by the run's arguments, so the old and new log-probs of a run come from one function.
+        if self.args.true_on_policy_mode:
+            return self._true_on_policy_score(logits.squeeze(0), with_entropy=with_entropy)
+        # RowLogProb has no entropy gradient and needs the whole vocabulary on this rank.
+        if self.args.entropy_coef == 0 and get_parallel_state().tp.size == 1:
+            return RowLogProb.apply(logits.squeeze(0), self._targets, self.args.rollout_temperature, with_entropy)
         log_probs, entropy = calculate_log_probs_and_entropy(
             logits.squeeze(0),
             self._targets,
@@ -428,6 +435,18 @@ class PaddedRows:
             debug_unified_grad_fused_logprob=self.args.debug_unified_grad_fused_logprob,
         )
         return log_probs.squeeze(-1), entropy
+
+    def _true_on_policy_score(self, logits, *, with_entropy):
+        """The rollout engine's own log-prob kernel; entropy, for the logs only, from RowLogProb without a gradient."""
+        # TPU only (padded rows run on a static-shape platform, and the mode is validated for TPU at startup)
+        from miles.backends.torchtitan_utils import true_on_policy
+
+        log_probs = true_on_policy.log_probs(logits, self._targets, self.args.rollout_temperature)
+        entropy = None
+        if with_entropy:
+            with torch.no_grad():
+                _, entropy = RowLogProb.apply(logits, self._targets, self.args.rollout_temperature, True)
+        return log_probs, entropy
 
     def map_logit_rows(self, logits, fn, side=None, *, side_fill=0):
         extra = None if side is None else self.rows_at_positions(side, fill=side_fill)

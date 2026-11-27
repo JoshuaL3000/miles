@@ -32,6 +32,7 @@
       "allowed_labels": [
         "bypass-fastfail",
         "run-ci-agentic",
+        "run-ci-algorithm",
         "run-ci-amd",
         "run-ci-blackwell-only",
         "run-ci-ckpt",
@@ -60,6 +61,7 @@
         "run-ci-sglang",
         "run-ci-short",
         "run-ci-torchtitan",
+        "run-ci-tpu",
         "run-ci-weight-update",
         "run-on-blackwell",
         "run-on-hopper"
